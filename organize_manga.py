@@ -5,17 +5,19 @@ import time
 import re
 import logging
 import json
+import unicodedata
 
 # Configuration
 CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
     "apis": ["jikan", "anilist", "mangadex", "kitsu"],
     "timeout": 45,
-    "rate_limit_delay": 1,  # Delay in seconds between API requests
+    "rate_limit_delay": 1,  # Default delay in seconds between API requests
     "max_retries": 3,
     "log_file": "manga_organizer.log",
     "library_directory": "E:\\TOTOdeF\\books organized\\002unned\\OTHER-ORGANIZE",
-    "target_directory": "E:\\TOTOdeF\\books organized\\002unned"
+    "target_directory": "E:\\TOTOdeF\\books organized\\002unned",
+    "cache_file": "metadata_cache.json"  # File to store cached metadata
 }
 
 # Load or create config
@@ -23,7 +25,9 @@ def load_or_create_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
+                loaded_config = json.load(f)
+                # Ensure all default keys are present in the loaded config
+                config = {**DEFAULT_CONFIG, **loaded_config}  # Merge defaults with loaded config
                 logging.info("Config file loaded successfully.")
         except json.JSONDecodeError:
             logging.error("Config file is empty or invalid. Creating a new one with default values.")
@@ -40,25 +44,57 @@ def load_or_create_config():
 config = load_or_create_config()
 
 # Set up logging
+logging.getLogger().handlers.clear()  # Clear existing handlers
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(config["log_file"]),
-        logging.StreamHandler()
+        logging.FileHandler(config["log_file"], encoding="utf-8"),  # Log to file with UTF-8
+        logging.StreamHandler()  # Log to console (CLI)
     ]
 )
+
+# Test logging
+logging.info("Script started. Logging is working!")
 
 # Rate limiting implementation
 last_api_call_time = 0
 
-def rate_limited_call():
+def rate_limited_call(response=None):
     global last_api_call_time
     elapsed = time.time() - last_api_call_time
     wait_time = config["rate_limit_delay"] - elapsed
+
+    # Dynamic rate limiting based on API response headers
+    if response:
+        rate_limit_remaining = int(response.headers.get("X-RateLimit-Remaining", 1))
+        rate_limit_reset = int(response.headers.get("X-RateLimit-Reset", config["rate_limit_delay"]))
+        if rate_limit_remaining == 0:
+            wait_time = max(wait_time, rate_limit_reset)
+            logging.warning(f"Rate limit reached. Waiting for {wait_time} seconds.")
+
     if wait_time > 0:
         time.sleep(wait_time)
     last_api_call_time = time.time()
+
+# Metadata caching
+def load_cache():
+    if os.path.exists(config["cache_file"]):
+        try:
+            with open(config["cache_file"], "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.error(f"Error loading cache: {e}")
+    return {}
+
+def save_cache(cache):
+    try:
+        with open(config["cache_file"], "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logging.error(f"Error saving cache: {e}")
+
+metadata_cache = load_cache()
 
 # Jikan (MyAnimeList) API
 def fetch_jikan_metadata(title):
@@ -68,6 +104,7 @@ def fetch_jikan_metadata(title):
         try:
             rate_limited_call()
             response = requests.get(url)
+            rate_limited_call(response)  # Update rate limit based on response
             response.raise_for_status()
             data = response.json()
             if data.get('data'):
@@ -104,6 +141,7 @@ def fetch_anilist_metadata(title):
         try:
             rate_limited_call()
             response = requests.post(url, json={"query": query, "variables": variables})
+            rate_limited_call(response)  # Update rate limit based on response
             response.raise_for_status()
             data = response.json()
             if data.get('data', {}).get('Media'):
@@ -127,6 +165,7 @@ def fetch_mangadex_metadata(title):
         try:
             rate_limited_call()
             response = requests.get(url)
+            rate_limited_call(response)  # Update rate limit based on response
             response.raise_for_status()
             data = response.json()
             if data.get('data'):
@@ -144,6 +183,7 @@ def fetch_kitsu_metadata(title):
         try:
             rate_limited_call()
             response = requests.get(url)
+            rate_limited_call(response)  # Update rate limit based on response
             response.raise_for_status()
             data = response.json()
             if data.get('data'):
@@ -154,40 +194,56 @@ def fetch_kitsu_metadata(title):
     return None
 
 def fetch_manga_metadata(title):
+    # Check cache first
+    if title in metadata_cache:
+        logging.info(f"Using cached metadata for: {title}")
+        return metadata_cache[title]
+
     metadata = {}
     for api_name in config["apis"]:
         if api_name == "jikan":
             result = fetch_jikan_metadata(title)
             if result:
                 metadata.update(result)
+                break  # Stop after the first successful fetch
         elif api_name == "anilist":
             result = fetch_anilist_metadata(title)
             if result:
                 metadata.update(result)
+                break
         elif api_name == "mangadex":
             result = fetch_mangadex_metadata(title)
             if result:
                 metadata.update(result)
+                break
         elif api_name == "kitsu":
             result = fetch_kitsu_metadata(title)
             if result:
                 metadata.update(result)
+                break
+
+    if metadata:
+        metadata_cache[title] = metadata
+        save_cache(metadata_cache)
     return metadata if metadata else None
 
 def save_metadata(metadata, folder):
     metadata_file = os.path.join(folder, "metadata.json")
-    with open(metadata_file, "w") as f:
-        json.dump(metadata, f, indent=4)
+    with open(metadata_file, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4, ensure_ascii=False)
     logging.info(f"Saved metadata to {metadata_file}")
 
 def load_metadata(folder):
     metadata_file = os.path.join(folder, "metadata.json")
     if os.path.exists(metadata_file):
-        with open(metadata_file, "r") as f:
+        with open(metadata_file, "r", encoding="utf-8") as f:
             return json.load(f)
     return None
 
 def clean_name(name):
+    # Normalize Unicode characters
+    name = unicodedata.normalize("NFKC", name)
+    # Remove unwanted characters
     cleaned_name = re.sub(r"\([^)]*\)", "", name)
     cleaned_name = re.sub(r"\{[^}]*\}", "", cleaned_name)
     cleaned_name = re.sub(r"\[[^]]*\]", "", cleaned_name)
@@ -212,17 +268,21 @@ def extract_base_title(filename):
 
 def rename_files_and_folders(directory):
     logging.info(f"Renaming files and folders in: {directory}")
-    for root, dirs, files in os.walk(directory, topdown=False):
+    renamed_items = set()  # Track renamed files and folders to avoid reprocessing
+
+    for root, dirs, files in os.walk(directory, topdown=False):  # Process subdirectories first
         for filename in files:
             if filename.endswith(".cbz") or filename.endswith(".epub") or filename.endswith(".zip"):
                 file_path = os.path.join(root, filename)
                 new_filename = clean_name(filename)
                 new_filename = format_title(new_filename)
                 new_file_path = os.path.join(root, new_filename)
-                if file_path != new_file_path:
+
+                if file_path != new_file_path and new_file_path not in renamed_items:
                     try:
                         shutil.move(file_path, new_file_path)
                         logging.info(f"Renamed file: {filename} -> {new_filename}")
+                        renamed_items.add(new_file_path)  # Track renamed file
                     except Exception as e:
                         logging.error(f"Error renaming file {filename}: {e}")
 
@@ -231,10 +291,12 @@ def rename_files_and_folders(directory):
             new_dirname = clean_name(dirname)
             new_dirname = format_title(new_dirname)
             new_dir_path = os.path.join(root, new_dirname)
-            if dir_path != new_dir_path:
+
+            if dir_path != new_dir_path and new_dir_path not in renamed_items:
                 try:
                     shutil.move(dir_path, new_dir_path)
                     logging.info(f"Renamed folder: {dirname} -> {new_dirname}")
+                    renamed_items.add(new_dir_path)  # Track renamed folder
                 except Exception as e:
                     logging.error(f"Error renaming folder {dirname}: {e}")
 
@@ -372,17 +434,9 @@ def main():
     manga_directory = config["library_directory"]
     target_directory = config["target_directory"]
 
-    while True:
-        rename_files_and_folders(manga_directory)
-        organize_manga(manga_directory, target_directory)
-        delete_empty_folders(manga_directory)
-
-        # Check for new folders
-        new_folders = [d for d in os.listdir(manga_directory) if os.path.isdir(os.path.join(manga_directory, d))]
-        if not new_folders:
-            break
-
-        logging.info("New folders found. Re-running organization...")
+    rename_files_and_folders(manga_directory)
+    organize_manga(manga_directory, target_directory)
+    delete_empty_folders(manga_directory)
 
     logging.info("Manga organization complete!")
 
